@@ -1,0 +1,1 @@
+class INATURALIST2018: pass

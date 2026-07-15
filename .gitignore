@@ -1,0 +1,23 @@
+﻿# 大模型文件
+CLIP14/model.safetensors
+CLIP14/*.safetensors
+CLIP14/models--openai--clip-vit-large-patch14/
+models/BLIP/pytorch_model.bin
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pth
+*.pt
+
+# Kaggle 训练产出
+dataset/
+open_world_image_clip_nonpretrained/
+
+# 系统文件
+.DS_Store
+.ipynb_checkpoints/
+
+# 敏感信息
+github-push.py
