@@ -80,27 +80,6 @@ class SAIDO_MultiScene(nn.Module):
         for p in self.fc.parameters():
             p.requires_grad = True
 
-        # ===== Iterative Refinement (experiment: borrow RITA iter_embed + feedback) =====
-        self.use_iterative = True
-        self.max_steps = 3
-        self.step_embed = nn.Embedding(self.max_steps, self.proj_dim)
-        self.refine = nn.Sequential(
-            nn.Linear(self.proj_dim * 2, self.proj_dim),
-            nn.GELU(),
-            nn.Dropout(p=0.1),
-            nn.Linear(self.proj_dim, self.proj_dim),
-        )
-        nn.init.normal_(self.step_embed.weight, 0.0, 0.02)
-        for layer in self.refine:
-            if isinstance(layer, nn.Linear):
-                nn.init.normal_(layer.weight, 0.0, 0.02)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-        for p in self.refine.parameters():
-            p.requires_grad = True
-        for p in self.step_embed.parameters():
-            p.requires_grad = True
-
         self._scenes = set()
         self._active_scene = None
 
@@ -147,18 +126,6 @@ class SAIDO_MultiScene(nn.Module):
         for p in self.fc.parameters():
             p.requires_grad = True
 
-    def _iterative_refine(self, embeds: torch.Tensor) -> torch.Tensor:
-        if not getattr(self, "use_iterative", True):
-            return embeds
-        state = embeds
-        B = embeds.size(0)
-        for k in range(self.max_steps):
-            step_ids = torch.full((B,), k, dtype=torch.long, device=embeds.device)
-            se = self.step_embed(step_ids)
-            h = self.refine(torch.cat([state, se], dim=-1))
-            state = state + h
-        return state
-
     def forward(self, images, task_labels=None, scene_id=None,batch_prompts=None):
         device = images.device
         B = images.size(0)
@@ -187,7 +154,7 @@ class SAIDO_MultiScene(nn.Module):
         proj = self.visual_projection(feats)
         proj = proj / (proj.norm(p=2, dim=-1, keepdim=True) + 1e-12)
         img_embeds = proj.squeeze(1)
-        logits = self.fc(self._iterative_refine(img_embeds))
+        logits = self.fc(img_embeds)
 
         if batch_prompts is None:
             return logits
