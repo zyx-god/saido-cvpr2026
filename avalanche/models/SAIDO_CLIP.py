@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 from transformers import CLIPVisionModel, CLIPTextModel, CLIPModel, CLIPTokenizer
 from peft import LoraConfig, get_peft_model, PeftModel  
 
@@ -80,10 +81,19 @@ class SAIDO_MultiScene(nn.Module):
         for p in self.fc.parameters():
             p.requires_grad = True
 
-        # ===== Iterative Refinement (experiment: borrow RITA iter_embed + feedback) =====
-        self.use_iterative = True
-        self.max_steps = 3
-        self.step_embed = nn.Embedding(self.max_steps, self.proj_dim)
+        # ===== Iterative Refinement (RITA-style feedback refinement) =====
+        # state_{k+1} = normalize(state_k + step_scale * bounded(delta_k)), k = 0..max_steps-1
+        # Two hard safety properties (both missing in the previous version):
+        #   1) the output layer is zero-initialized -> delta == 0 at init, so the module is
+        #      an exact identity and step 0 reproduces the baseline bit-for-bit;
+        #   2) every update has norm < step_scale and the state is re-normalized to the unit
+        #      sphere after each step -> the loop cannot blow up, and fc keeps seeing the
+        #      exact input scale it was designed for.
+        # SAIDO_ITER_STEPS=0 -> module disabled, behaviour identical to the baseline.
+        self.max_steps = max(0, int(os.environ.get("SAIDO_ITER_STEPS", "3")))
+        self.use_iterative = self.max_steps > 0
+        self.step_scale = float(os.environ.get("SAIDO_ITER_STEP_SCALE", "0.1"))
+        self.step_embed = nn.Embedding(max(self.max_steps, 1), self.proj_dim)
         self.refine = nn.Sequential(
             nn.Linear(self.proj_dim * 2, self.proj_dim),
             nn.GELU(),
@@ -96,10 +106,13 @@ class SAIDO_MultiScene(nn.Module):
                 nn.init.normal_(layer.weight, 0.0, 0.02)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.refine[-1].weight)
+        if self.refine[-1].bias is not None:
+            nn.init.zeros_(self.refine[-1].bias)
         for p in self.refine.parameters():
-            p.requires_grad = True
+            p.requires_grad = self.use_iterative
         for p in self.step_embed.parameters():
-            p.requires_grad = True
+            p.requires_grad = self.use_iterative
 
         self._scenes = set()
         self._active_scene = None
@@ -148,15 +161,19 @@ class SAIDO_MultiScene(nn.Module):
             p.requires_grad = True
 
     def _iterative_refine(self, embeds: torch.Tensor) -> torch.Tensor:
-        if not getattr(self, "use_iterative", True):
+        if (not getattr(self, "use_iterative", False)) or self.max_steps <= 0:
             return embeds
         state = embeds
         B = embeds.size(0)
         for k in range(self.max_steps):
             step_ids = torch.full((B,), k, dtype=torch.long, device=embeds.device)
             se = self.step_embed(step_ids)
-            h = self.refine(torch.cat([state, se], dim=-1))
-            state = state + h
+            delta = self.refine(torch.cat([state, se], dim=-1))
+            delta = torch.tanh(delta)
+            dnorm = delta.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+            delta = delta / dnorm * torch.tanh(dnorm) * self.step_scale
+            state = state + delta
+            state = state / state.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-3)
         return state
 
     def forward(self, images, task_labels=None, scene_id=None,batch_prompts=None):

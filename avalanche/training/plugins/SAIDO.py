@@ -47,7 +47,16 @@ def _is_lora_param_name(n: str):
 
 
 def _is_shared_head_name(n: str):
-    return ("visual_projection.weight" in n) or ("fc." in n and ".weight" in n)
+    # `refine.*` / `step_embed.*` belong to the iterative-refinement module in
+    # SAIDO_CLIP.py. They are shared across all scenes, so IDOM has to treat them
+    # like the other shared head params (importance masks + gradient scaling)
+    # instead of letting them train on unscaled gradients.
+    return (
+        ("visual_projection.weight" in n)
+        or ("fc." in n and ".weight" in n)
+        or n.startswith("refine.")
+        or n.startswith("step_embed.")
+    )
 
 
 class SAIDOPlugin(StrategyPlugin):
