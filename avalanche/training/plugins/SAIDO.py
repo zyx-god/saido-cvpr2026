@@ -85,10 +85,6 @@ class SAIDOPlugin(StrategyPlugin):
         # Diagnostic: stop at the first non-finite gradient instead of writing NaN into the
         # weights and losing the whole run. Set SAIDO_NAN_GUARD=0 to disable.
         self._nan_guard = os.environ.get('SAIDO_NAN_GUARD', '1') == '1'
-        # torch.quantile costs ~30 ms per call on the CPU, and the aggregated importance of
-        # a given (experience, scene, parameter) is identical for every mini-batch of that
-        # scene. Memoize it by that triple instead of recomputing it ~280 times per scene.
-        self._quantile_cache = {}
 
         self.old_grad_shared = {}
 
@@ -131,17 +127,13 @@ class SAIDOPlugin(StrategyPlugin):
         for k in bucket:
             bucket[k] /= float(count)
 
-    def _grad_scale_from_importance(self, imp_tensor: torch.Tensor, cache_key=None):
+    def _grad_scale_from_importance(self, imp_tensor: torch.Tensor):
         if (imp_tensor is None) or (not self.use_grad_scale):
             return None
         flat = imp_tensor.flatten().float()
         if flat.numel() == 0:
             return None
-        q = self._quantile_cache.get(cache_key) if cache_key is not None else None
-        if q is None:
-            q = torch.quantile(flat, 0.9) if flat.numel() > 1 else (flat.abs().max() + 1e-8)
-            if cache_key is not None:
-                self._quantile_cache[cache_key] = q
+        q = torch.quantile(flat, 0.9) if flat.numel() > 1 else (flat.abs().max() + 1e-8)
         denom = (q + 1e-8)
         imp_norm = imp_tensor / denom
         scale = 1.0 / (1.0 + self.grad_scale_k * (imp_norm.clamp_min(0.0) ** self.grad_scale_beta))
@@ -404,8 +396,7 @@ class SAIDOPlugin(StrategyPlugin):
                         total_imp_hist = None
                         if has_imp:
                             total_imp_hist = (zr + zf)
-                        scale = self._grad_scale_from_importance(
-                            total_imp_hist, (cur_exp, current_scene, n))
+                        scale = self._grad_scale_from_importance(total_imp_hist)
                         if scale is not None:
                             new_grad = new_grad * scale.to(new_grad.dtype)
 
@@ -423,8 +414,6 @@ class SAIDOPlugin(StrategyPlugin):
     def after_training_exp(self, strategy, **kwargs):
         model = strategy.model
         device = strategy.device
-        # Keys contain the experience index, so this is only to keep it from growing.
-        self._quantile_cache.clear()
         bs = strategy.train_mb_size
         dataset = strategy.experience.dataset
 
