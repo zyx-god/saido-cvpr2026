@@ -43,13 +43,13 @@ def _get_scene_from_batch_or_model(batch, model):
     return scene_id
 
 
-def _compact_imp(d: dict):
-    # IDOM stores one importance tensor per (experience, scene). With 9 experiences and
-    # about 10 scenes that is roughly 90 copies of a single adapter LoRA tensors, which
-    # reach ~8.5 GiB in fp32 on top of the model and OOM the T4. The stored tensors are
-    # only compared against a quantile and fed into a quantile-normalized gradient scale,
-    # so fp16 costs nothing measurable and cuts their footprint in half.
-    return {k: (v.half() if torch.is_tensor(v) else v) for k, v in d.items()}
+def _to_cpu_imp(d: dict):
+    # IDOM keeps one fp32 tensor per (experience, scene): 9 experiences times about 8
+    # scenes is ~72 copies of a single adapter LoRA tensors, which reach ~8.4 GiB and OOM
+    # the T4. They are read back only in before_update, so they stay on the CPU and get
+    # moved to the GPU per parameter on demand. fp32 is deliberate: in fp16 the clamp_min
+    # value 1e-12 underflows to 0, so the ratio 0/0 turned gradients into NaN.
+    return {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in d.items()}
 
 
 def _is_lora_param_name(n: str):
@@ -82,6 +82,9 @@ class SAIDOPlugin(StrategyPlugin):
         self.use_grad_scale = bool(use_grad_scale)
         self.grad_scale_k = float(grad_scale_k)
         self.grad_scale_beta = float(grad_scale_beta)
+        # Diagnostic: stop at the first non-finite gradient instead of writing NaN into the
+        # weights and losing the whole run. Set SAIDO_NAN_GUARD=0 to disable.
+        self._nan_guard = os.environ.get('SAIDO_NAN_GUARD', '1') == '1'
 
         self.old_grad_shared = {}
 
@@ -149,7 +152,7 @@ class SAIDOPlugin(StrategyPlugin):
 
         # IDOM must see every scene of the experience. SceneGroupedTaskBalancedDataLoader
         # emits one scene at a time, so the previous hard cap of 50 batches could stop inside
-        # the first scene: the other scenes then had no importance entry, after_backward
+        # the first scene: the other scenes then had no importance entry, before_update
         # skipped them, and their LoRA params trained on unscaled gradients. One iteration
         # costs the same memory as one training step, so the full traversal is safe and
         # SAIDO_IMP_MAX_BATCHES is only an emergency brake.
@@ -221,10 +224,10 @@ class SAIDOPlugin(StrategyPlugin):
         self._normalize_imp(shared_real, shared_real_cnt)
         self._normalize_imp(shared_fake, shared_fake_cnt)
 
-        scene_real = {s: _compact_imp(d) for s, d in scene_real.items()}
-        scene_fake = {s: _compact_imp(d) for s, d in scene_fake.items()}
-        shared_real = _compact_imp(shared_real)
-        shared_fake = _compact_imp(shared_fake)
+        scene_real = {s: _to_cpu_imp(d) for s, d in scene_real.items()}
+        scene_fake = {s: _to_cpu_imp(d) for s, d in scene_fake.items()}
+        shared_real = _to_cpu_imp(shared_real)
+        shared_fake = _to_cpu_imp(shared_fake)
 
         gpu_gib = 0.0
         if torch.cuda.is_available():
@@ -350,8 +353,16 @@ class SAIDOPlugin(StrategyPlugin):
                     if forget_gate is None:
                         continue
 
-                    pre_r = pre_real.get(n, torch.zeros_like(forget_gate))
-                    pre_f = pre_fake.get(n, torch.zeros_like(forget_gate))
+                    dev = p.grad.device
+                    forget_gate = forget_gate.to(dev)
+                    has_imp = (real_imp_hist is not None) or (fake_imp_hist is not None)
+                    if has_imp:
+                        zr = real_imp_hist.to(dev) if real_imp_hist is not None else torch.zeros_like(p.grad)
+                        zf = fake_imp_hist.to(dev) if fake_imp_hist is not None else torch.zeros_like(p.grad)
+                    pre_r = pre_real.get(n, None)
+                    pre_f = pre_fake.get(n, None)
+                    pre_r = torch.zeros_like(forget_gate) if pre_r is None else pre_r.to(dev)
+                    pre_f = torch.zeros_like(forget_gate) if pre_f is None else pre_f.to(dev)
                     grad_filter = (pre_r + pre_f) * forget_gate
                     current_grad = p.grad.clone()
                     if n in self._lora_param_names:
@@ -369,12 +380,10 @@ class SAIDOPlugin(StrategyPlugin):
                         proj = dot * old_grad / (old_grad.norm() ** 2)
                         proj = proj.view_as(p.grad)
                         ortho = current_grad - proj
-                        if (real_imp_hist is not None) or (fake_imp_hist is not None):
-                            r_imp = real_imp_hist if real_imp_hist is not None else torch.zeros_like(p.grad)
-                            f_imp = fake_imp_hist if fake_imp_hist is not None else torch.zeros_like(p.grad)
-                            total_imp = (r_imp + f_imp).clamp_min(1e-12)
-                            w_real = (r_imp / total_imp).to(p.grad.dtype)
-                            w_fake = (f_imp / total_imp).to(p.grad.dtype)
+                        if has_imp:
+                            total_imp = (zr + zf).clamp_min(1e-12)
+                            w_real = (zr / total_imp).to(p.grad.dtype)
+                            w_fake = (zf / total_imp).to(p.grad.dtype)
                         else:
                             w_real = torch.full_like(p.grad, 0.5)
                             w_fake = torch.full_like(p.grad, 0.5)
@@ -385,14 +394,16 @@ class SAIDOPlugin(StrategyPlugin):
 
                     if self.use_grad_scale:
                         total_imp_hist = None
-                        if (real_imp_hist is not None) or (fake_imp_hist is not None):
-                            r_imp = real_imp_hist if real_imp_hist is not None else torch.zeros_like(p.grad)
-                            f_imp = fake_imp_hist if fake_imp_hist is not None else torch.zeros_like(p.grad)
-                            total_imp_hist = (r_imp + f_imp)
+                        if has_imp:
+                            total_imp_hist = (zr + zf)
                         scale = self._grad_scale_from_importance(total_imp_hist)
                         if scale is not None:
                             new_grad = new_grad * scale.to(new_grad.dtype)
 
+                    if self._nan_guard and not torch.isfinite(new_grad).all():
+                        raise RuntimeError(
+                            '[SAIDO] non-finite gradient for %s at experience %s scene %s' % (
+                                n, cur_exp, current_scene))
                     p.grad.copy_(new_grad)
 
                     if n in self._lora_param_names:
