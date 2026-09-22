@@ -13,6 +13,8 @@ Usage:
 """
 import os, argparse
 import sys
+import collections
+import random
 import torch
 from pathlib import Path
 from PIL import Image
@@ -100,6 +102,50 @@ def write_annotation_file(txt_path, records, model_map,
             f.write(f"{img_path.as_posix()}\t{caption}\t{scene_id}\t_\t{model_label}\t{rf_label}\n")
 
 
+def allocate_split_counts(n, train_ratio, val_ratio):
+    '''Split n items of one stratum into (train, val, test) counts.'''
+    if n <= 2:
+        return n, 0, 0
+    if n < 7:
+        return n - 2, 1, 1
+    n_train = int(round(n * train_ratio))
+    n_val = int(round(n * val_ratio))
+    if n_val < 1:
+        n_val = 1
+    if n_train + n_val > n - 1:
+        n_train = n - n_val - 1
+    if n_train < 1:
+        n_train = 1
+        n_val = max(0, n - 2)
+    return n_train, n_val, n - n_train - n_val
+
+
+def stratified_split_records(records, seed=20260101,
+                             train_ratio=0.70, val_ratio=0.15):
+    '''Split by (model_label, realfake_label, scene_id).
+
+    A plain file-name-order split does NOT keep train/val/test comparable:
+    ImageNet file names are grouped by WNID, so whole semantic categories end
+    up in a single split, and the scene distribution of test drifts far away
+    from train.'''
+    groups = collections.defaultdict(list)
+    for rec in records:
+        groups[(str(rec[2]), str(rec[3]), str(rec[1]))].append(rec)
+    rng = random.Random(seed)
+    train_set, val_set, test_set = [], [], []
+    for key in sorted(groups):
+        items = sorted(groups[key], key=lambda r: r[0].as_posix())
+        rng.shuffle(items)
+        n_train, n_val, _ = allocate_split_counts(len(items), train_ratio, val_ratio)
+        train_set.extend(items[:n_train])
+        val_set.extend(items[n_train:n_train + n_val])
+        test_set.extend(items[n_train + n_val:])
+    rng.shuffle(train_set)
+    rng.shuffle(val_set)
+    rng.shuffle(test_set)
+    return train_set, val_set, test_set
+
+
 def main():
     print("=" * 60)
     print("SAIDO Scene Classification + Annotation (v3 -- BLIP caption)")
@@ -113,6 +159,12 @@ def main():
                         help="Path to BLIP model folder")
     parser.add_argument("--device", type=str, default=None,
                         help="Compute device (auto: cuda/cpu)")
+    parser.add_argument("--seed", type=int, default=20260101,
+                        help="Seed of the stratified train/val/test split")
+    parser.add_argument("--train_ratio", type=float, default=0.70,
+                        help="Train ratio of the stratified split")
+    parser.add_argument("--val_ratio", type=float, default=0.15,
+                        help="Validation ratio of the stratified split")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -165,7 +217,7 @@ def main():
                     f.write(f"{img_name}\t{sid}\n")
 
     print("\n[3/3] Generating annotation files...")
-    train_records, val_records, test_records = [], [], []
+    all_records = []
 
     for model_name, model_id in MODEL_MAP.items():
         for label_name, rf_label in [("real", 0), ("fake", 1)]:
@@ -179,21 +231,18 @@ def main():
                     parts = line.strip().split("\t")
                     if len(parts) == 2:
                         scene_map[parts[0]] = int(parts[1])
-            all_imgs = sorted(img_dir.glob("*"))
-            all_imgs = [p for p in all_imgs if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")]
-            all_imgs = [p for p in all_imgs if p.name in scene_map]
-            n_total = len(all_imgs)
-            n_train = int(n_total * 0.7)
-            n_val = int(n_total * 0.15)
-            for i, img_path in enumerate(all_imgs):
-                sid = scene_map.get(img_path.name, 0)
-                record = (img_path, sid, model_id, rf_label)
-                if i < n_train:
-                    train_records.append(record)
-                elif i < n_train + n_val:
-                    val_records.append(record)
-                else:
-                    test_records.append(record)
+            for img_path in sorted(img_dir.glob("*")):
+                if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".bmp"):
+                    continue
+                if img_path.name not in scene_map:
+                    continue
+                all_records.append((img_path, scene_map[img_path.name], model_id, rf_label))
+
+    train_records, val_records, test_records = stratified_split_records(
+        all_records, seed=args.seed,
+        train_ratio=args.train_ratio, val_ratio=args.val_ratio)
+    print("  stratified split: train=%d val=%d test=%d" % (
+        len(train_records), len(val_records), len(test_records)))
 
     for model_name in MODEL_MAP:
         for label_name in ["real", "fake"]:
