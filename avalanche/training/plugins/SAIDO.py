@@ -1,5 +1,6 @@
 ﻿import copy
 from collections import defaultdict
+import os
 import torch
 import math
 import random
@@ -137,13 +138,19 @@ class SAIDOPlugin(StrategyPlugin):
         shared_real_cnt = 0
         shared_fake_cnt = 0
 
+        # IDOM must see every scene of the experience. SceneGroupedTaskBalancedDataLoader
+        # emits one scene at a time, so the previous hard cap of 50 batches could stop inside
+        # the first scene: the other scenes then had no importance entry, after_backward
+        # skipped them, and their LoRA params trained on unscaled gradients. One iteration
+        # costs the same memory as one training step, so the full traversal is safe and
+        # SAIDO_IMP_MAX_BATCHES is only an emergency brake.
+        _imp_max_batches = int(os.environ.get('SAIDO_IMP_MAX_BATCHES', '0'))
         tmp_loader = SceneGroupedTaskBalancedDataLoader(dataset, batch_size=batch_size, shuffle=False)
         _imp_batch_count = 0
-        _imp_max_batches = max(50, batch_size)  # 最多处理 50 个 batch，防止 OOM
         for batch in tmp_loader:
-            _imp_batch_count += 1
-            if _imp_batch_count > _imp_max_batches:
+            if _imp_max_batches > 0 and _imp_batch_count >= _imp_max_batches:
                 break
+            _imp_batch_count += 1
             if isinstance(batch, (list, tuple)) and len(batch) >= 3:
                 x, y, task_label,scene_id,batch_prompts = batch
             else:
@@ -204,6 +211,10 @@ class SAIDOPlugin(StrategyPlugin):
             self._normalize_imp(scene_fake[s], scene_fake_cnt[s])
         self._normalize_imp(shared_real, shared_real_cnt)
         self._normalize_imp(shared_fake, shared_fake_cnt)
+
+        print('[SAIDO] importance coverage: batches=%d scenes=%s real=%d fake=%d' % (
+            _imp_batch_count, sorted(set(scene_real) | set(scene_fake)),
+            shared_real_cnt, shared_fake_cnt))
 
         return scene_real, scene_fake, shared_real, shared_fake
 
