@@ -43,6 +43,15 @@ def _get_scene_from_batch_or_model(batch, model):
     return scene_id
 
 
+def _compact_imp(d: dict):
+    # IDOM stores one importance tensor per (experience, scene). With 9 experiences and
+    # about 10 scenes that is roughly 90 copies of a single adapter LoRA tensors, which
+    # reach ~8.5 GiB in fp32 on top of the model and OOM the T4. The stored tensors are
+    # only compared against a quantile and fed into a quantile-normalized gradient scale,
+    # so fp16 costs nothing measurable and cuts their footprint in half.
+    return {k: (v.half() if torch.is_tensor(v) else v) for k, v in d.items()}
+
+
 def _is_lora_param_name(n: str):
     return "lora_" in n
 
@@ -118,7 +127,7 @@ class SAIDOPlugin(StrategyPlugin):
     def _grad_scale_from_importance(self, imp_tensor: torch.Tensor):
         if (imp_tensor is None) or (not self.use_grad_scale):
             return None
-        flat = imp_tensor.flatten()
+        flat = imp_tensor.flatten().float()
         if flat.numel() == 0:
             return None
         q = torch.quantile(flat, 0.9) if flat.numel() > 1 else (flat.abs().max() + 1e-8)
@@ -212,9 +221,17 @@ class SAIDOPlugin(StrategyPlugin):
         self._normalize_imp(shared_real, shared_real_cnt)
         self._normalize_imp(shared_fake, shared_fake_cnt)
 
-        print('[SAIDO] importance coverage: batches=%d scenes=%s real=%d fake=%d' % (
+        scene_real = {s: _compact_imp(d) for s, d in scene_real.items()}
+        scene_fake = {s: _compact_imp(d) for s, d in scene_fake.items()}
+        shared_real = _compact_imp(shared_real)
+        shared_fake = _compact_imp(shared_fake)
+
+        gpu_gib = 0.0
+        if torch.cuda.is_available():
+            gpu_gib = torch.cuda.memory_allocated() / (1024 ** 3)
+        print('[SAIDO] importance coverage: batches=%d scenes=%s real=%d fake=%d gpu=%.2fGiB' % (
             _imp_batch_count, sorted(set(scene_real) | set(scene_fake)),
-            shared_real_cnt, shared_fake_cnt))
+            shared_real_cnt, shared_fake_cnt, gpu_gib))
 
         return scene_real, scene_fake, shared_real, shared_fake
 
@@ -223,8 +240,8 @@ class SAIDOPlugin(StrategyPlugin):
         for n, t in imp_dict.items():
             if t is None:
                 continue
-            thr = torch.quantile(t.flatten(), q)
-            masks[n] = (t > thr).to(torch.int) * int(scale)
+            thr = torch.quantile(t.flatten().float(), q)
+            masks[n] = (t > thr).to(torch.int8) * int(scale)
         return masks
 
     def set_ebbinghaus_forgetting_weight(self, task_num):
